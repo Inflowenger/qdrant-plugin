@@ -40,11 +40,14 @@ the model that fills it.
 |--------|--------------|
 | **Create collection** | Create a collection with a vector size and distance metric. |
 | **List collections** | Names of every collection on the instance. |
-| **Upsert points** | Insert or overwrite points. Give each a `vector`, or a `text` to embed. |
-| **Vector search** | Nearest-neighbour search by query `text` (embedded) or a raw `vector`, optionally filtered. |
+| **Upsert points** | Insert or overwrite points. Give a `text` to embed (or a `vector`) plus key/value payload tags, or a batch JSON array. |
+| **Vector search** | Nearest-neighbour search by query `text` (embedded) or a raw `vector`, narrowed by key/value payload filters. |
 | **Retrieve points** | Fetch points by their IDs. |
 | **Scroll points** | Page through points by filter, no query vector. |
 | **Delete points** | Delete by an ID list or by a payload filter. |
+
+On every point action the **Collection** box has a **List** button (↻) — press it to
+pick from the collections already on the instance instead of typing the name.
 
 Structured fields (vector, points, filter, IDs) are entered as **JSON**. For
 example, a search filter:
@@ -53,11 +56,20 @@ example, a search filter:
 { "must": [ { "key": "tag", "match": { "value": "docs" } } ] }
 ```
 
-### Working with text
+### Working with text and tags
 
-With an embedding provider configured, upsert points by content — no `vector`
-needed. An `id` is generated when omitted, and the source text is kept under
-`payload.text` so it comes back with search hits:
+With an embedding provider configured, **Upsert points** takes plain content — no
+JSON, no hand-built vector:
+
+- **Text to embed** — embedded with the provider and kept under `payload.text` so
+  it comes back with search hits.
+- **Payload tags** — an add/remove list of **key/value** rows stored on the point's
+  payload (e.g. `sku` → `B1`, `category` → `bikes`). Filter on these later.
+- **Point ID** — optional; a UUID is generated when left blank.
+
+A value that reads as a number or boolean is stored as one (`42`, `true`); wrap it
+in quotes (`"42"`) to keep it a string. To write a **batch**, paste a **Points**
+JSON array under *Batch (advanced)* instead — it overrides the single-point fields:
 
 ```json
 [
@@ -66,12 +78,22 @@ needed. An `id` is generated when omitted, and the source text is kept under
 ]
 ```
 
-Then search by text:
+Then search by text and narrow with the same tags:
 
 > **Query text:** `something to ride off-road`
+> **Payload filters:** `category` → `bikes`
 
-The plugin embeds the query with the same provider and returns the nearest points.
-You can still pass a raw `vector` on either action to bypass embedding.
+The plugin embeds the query with the same provider and returns the nearest points
+whose payload matches every filter row. The **Payload filters** rows are combined
+with any raw **Filter** JSON (they are added to its `must`). You can still pass a
+raw `vector` on either action to bypass embedding.
+
+### JsonPath tokens
+
+Any text field — **Text to embed**, a **Query text**, and each **key/value** — may
+contain a `{{$.path}}` token that is resolved from the flow's context before the
+action runs. For example, a payload tag value of `{{$.trigger.userId}}` stores the
+upstream trigger's user id. Tokens the context can't supply are left in place.
 
 ## Test the connection
 

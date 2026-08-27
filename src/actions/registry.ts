@@ -23,6 +23,7 @@ import {
   type EmbeddingProvider,
   type EmbeddingSettings,
 } from "../embeddings/provider.js";
+import { resolveInputVars } from "./vars.js";
 import {
   createCollectionForm,
   deleteForm,
@@ -65,6 +66,7 @@ export class Registry {
     return [
       { method: "qdrant.meta.ping", requestHandler: (req) => this.metaPing(req) },
       { method: "qdrant.meta.embed", requestHandler: (req) => this.metaEmbed(req) },
+      { method: "qdrant.meta.collections", requestHandler: (req) => this.metaCollections(req) },
     ];
   }
 
@@ -113,8 +115,7 @@ export class Registry {
       requestHandler: (job) =>
         this.run(job, "Upserting points", async (qc, body, emb) => {
           const name = str(body.collection);
-          const raw = jsonArray(body.points, "points");
-          const points = await resolvePoints(raw, emb);
+          const points = await buildUpsertPoints(body, emb);
           const result = await qc.upsert(name, points, bool(body.wait, true));
           return { upserted: points.length, result };
         }),
@@ -134,7 +135,7 @@ export class Registry {
           const vector = await resolveQueryVector(body, emb);
           const limit = int(body.limit ?? 10, "limit");
           const result = await qc.search(name, vector, limit, {
-            filter: jsonObjectOrUndefined(body.filter, "filter"),
+            filter: buildFilter(body.filters, body.filter),
             withPayload: bool(body.withPayload, true),
             withVector: bool(body.withVector),
             scoreThreshold: body.scoreThreshold == null ? undefined : num(body.scoreThreshold, "scoreThreshold"),
@@ -239,6 +240,10 @@ export class Registry {
     }
 
     try {
+      // Resolve {{$.path}} JsonPath tokens (in text, payload tags, filter values,
+      // …) against the flow scope before the action reads any of them.
+      await resolveInputVars(job, body);
+
       const qc = new Qdrant(settings);
       await job.progress(20, { title, content: str(body.collection) || settings.url });
       const out = await work(qc, body, embedding);
@@ -329,7 +334,55 @@ export class Registry {
       };
     }
   }
+
+  // metaCollections backs the "List" button on the collection field: list the
+  // instance's collections and rebuild the calling form with that field turned
+  // into a drop-down. `form` (set by the field's .picks) names which form to
+  // rebuild; without a match the names are reported as text instead.
+  private async metaCollections(req: Request): Promise<unknown> {
+    const call = metaInput(req);
+    let settings: QdrantSettings;
+    try {
+      settings = readSettings(call.settings);
+    } catch (e) {
+      return formkit.failure("%s", errText(e)).about("collection").patch(null);
+    }
+
+    let names: string[];
+    try {
+      const qc = new Qdrant(settings);
+      const res = (await qc.listCollections()) as { collections?: { name: string }[] };
+      names = (res.collections ?? []).map((c) => c.name).filter((n) => n);
+    } catch (e) {
+      return formkit.failure("Cannot list collections: %s", errText(e)).about("collection").patch(null);
+    }
+    if (names.length === 0) {
+      return formkit.warning("No collections on %s yet.", settings.url).about("collection").patch(null);
+    }
+
+    const options = names.map((n) => ({ value: n, label: n }));
+    const target = str(call.targetField) || "collection";
+    const heading = formkit.success("%s collection(s) on %s — pick one.", String(names.length), settings.url);
+    const owner = collectionForms[str(call.form)];
+    if (!owner) {
+      // Nothing to rebuild into a drop-down — list what we found as text.
+      return formkit.info("Collections on %s:\n%s", settings.url, formkit.lines(options)).about(target).patch(null);
+    }
+    return formkit.choose(owner, target, options, formkit.formData(call), heading);
+  }
 }
+
+// collectionForms maps an action method to the form its collection "List" button
+// rebuilds. Kept beside the meta that reads it so a new action with a collection
+// picker is wired in one place — the method here must match the .picks() the
+// field carries in forms.ts.
+const collectionForms: Record<string, typeof upsertForm> = {
+  "qdrant.points.upsert": upsertForm,
+  "qdrant.points.search": searchForm,
+  "qdrant.points.retrieve": retrieveForm,
+  "qdrant.points.scroll": scrollForm,
+  "qdrant.points.delete": deleteForm,
+};
 
 // ---------------------------------------------------------------- helpers --
 
@@ -441,6 +494,111 @@ async function resolveQueryVector(
     return numberArray(jsonArray(body.vector, "vector"), "vector");
   }
   throw new Error('provide a query "text" (with an embedding provider) or a raw "vector"');
+}
+
+// buildUpsertPoints turns the Upsert form into the points array Qdrant wants. A
+// pasted "points" JSON array is the batch path (unchanged). Otherwise one point is
+// assembled from the friendly fields: a "text" to embed (or an explicit "vector"),
+// the key/value "tags" as its payload, and an optional id. resolvePoints does the
+// embedding, the payload.text bookkeeping, and id generation for the single point
+// exactly as it does for a batch.
+async function buildUpsertPoints(
+  body: Record<string, unknown>,
+  emb: EmbeddingSettings,
+): Promise<Record<string, unknown>[]> {
+  const rawPoints = jsonOrUndefined(body.points);
+  if (rawPoints !== undefined) {
+    return resolvePoints(asArray(rawPoints, "points"), emb);
+  }
+
+  const point: Record<string, unknown> = {};
+  const id = str(body.id).trim();
+  if (id !== "") point.id = coerceId(id);
+
+  const payload = kvToObject(body.tags, "tags");
+  if (Object.keys(payload).length > 0) point.payload = payload;
+
+  const text = str(body.text).trim();
+  const hasVector = body.vector != null && str(body.vector).trim() !== "";
+  if (hasVector) point.vector = numberArray(jsonArray(body.vector, "vector"), "vector");
+  if (text !== "") point.text = text;
+  if (!hasVector && text === "") {
+    throw new Error('provide a "Text to embed", a "Vector", or a "Points" JSON array');
+  }
+  return resolvePoints([point], emb);
+}
+
+// buildFilter combines the key/value "filters" rows (each an exact payload match)
+// with any raw Qdrant "filter" JSON. The rows are appended to the filter's `must`,
+// so both narrow the results together; either may be absent.
+function buildFilter(
+  filtersRaw: unknown,
+  filterRaw: unknown,
+): Record<string, unknown> | undefined {
+  const base = jsonObjectOrUndefined(filterRaw, "filter");
+  const rows = kvRows(filtersRaw, "filters");
+  if (rows.length === 0) return base;
+  const conditions = rows.map(({ key, value }) => ({ key, match: { value: coerceValue(value) } }));
+  const filter: Record<string, unknown> = base ? { ...base } : {};
+  const existing = Array.isArray(filter.must) ? filter.must : filter.must == null ? [] : [filter.must];
+  filter.must = [...existing, ...conditions];
+  return filter;
+}
+
+// kvToObject turns key/value rows into a payload object, coercing each value.
+function kvToObject(raw: unknown, field: string): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const { key, value } of kvRows(raw, field)) out[key] = coerceValue(value);
+  return out;
+}
+
+// kvRows validates the [{ key, value }, …] shape the key/value list fields submit.
+// An empty/absent list is fine (no rows); a row must carry a non-empty key.
+function kvRows(raw: unknown, field: string): { key: string; value: string }[] {
+  if (raw == null) return [];
+  if (!Array.isArray(raw)) throw new Error(`"${field}" must be a list of key/value rows`);
+  return raw.map((r, i) => {
+    if (typeof r !== "object" || r === null || Array.isArray(r)) {
+      throw new Error(`"${field}"[${i}] must be a key/value row`);
+    }
+    const rec = r as Record<string, unknown>;
+    const key = str(rec.key).trim();
+    if (key === "") throw new Error(`"${field}"[${i}] has no key`);
+    return { key, value: str(rec.value) };
+  });
+}
+
+// coerceValue reads one key/value string as the type it most plainly denotes:
+// true/false → boolean, a bare number → number, everything else the string. A
+// value wrapped in double quotes is forced to stay a string ("42" → 42-the-text).
+function coerceValue(s: string): string | number | boolean {
+  const t = s.trim();
+  if (t === "") return s;
+  if (t === "true") return true;
+  if (t === "false") return false;
+  if (/^-?\d+(\.\d+)?$/.test(t)) {
+    const n = Number(t);
+    if (Number.isFinite(n)) return n;
+  }
+  if (t.length >= 2 && t.startsWith('"') && t.endsWith('"')) {
+    try {
+      const p = JSON.parse(t);
+      if (typeof p === "string") return p;
+    } catch {
+      // fall through to the raw string
+    }
+  }
+  return s;
+}
+
+// coerceId keeps a Qdrant point id valid: a run of digits is an unsigned integer,
+// anything else (a UUID) stays a string.
+function coerceId(s: string): string | number {
+  if (/^\d+$/.test(s)) {
+    const n = Number(s);
+    if (Number.isSafeInteger(n)) return n;
+  }
+  return s;
 }
 
 function str(v: unknown): string {
