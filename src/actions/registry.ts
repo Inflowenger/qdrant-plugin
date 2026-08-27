@@ -6,6 +6,7 @@
 
 import {
   castRequestTo,
+  formkit,
   type Action,
   type Job,
   type Meta,
@@ -14,7 +15,14 @@ import {
   type Settings,
 } from "@inflowenger/node-plugin-sdk";
 
+import { randomUUID } from "node:crypto";
+
 import { Qdrant, type Distance, type QdrantSettings } from "../qdrant/client.js";
+import {
+  embedTexts,
+  type EmbeddingProvider,
+  type EmbeddingSettings,
+} from "../embeddings/provider.js";
 import {
   createCollectionForm,
   deleteForm,
@@ -54,7 +62,10 @@ export class Registry {
 
   /** Live meta functions the forms can call while open. */
   metas(): Meta[] {
-    return [{ method: "qdrant.meta.ping", requestHandler: (req) => this.metaPing(req) }];
+    return [
+      { method: "qdrant.meta.ping", requestHandler: (req) => this.metaPing(req) },
+      { method: "qdrant.meta.embed", requestHandler: (req) => this.metaEmbed(req) },
+    ];
   }
 
   // ------------------------------------------------------------- actions --
@@ -100,9 +111,10 @@ export class Registry {
       icon: { icon: "mdi-database-import" },
       form: upsertForm,
       requestHandler: (job) =>
-        this.run(job, "Upserting points", async (qc, body) => {
+        this.run(job, "Upserting points", async (qc, body, emb) => {
           const name = str(body.collection);
-          const points = jsonArray(body.points, "points");
+          const raw = jsonArray(body.points, "points");
+          const points = await resolvePoints(raw, emb);
           const result = await qc.upsert(name, points, bool(body.wait, true));
           return { upserted: points.length, result };
         }),
@@ -117,9 +129,9 @@ export class Registry {
       icon: { icon: "mdi-vector-triangle" },
       form: searchForm,
       requestHandler: (job) =>
-        this.run(job, "Searching", async (qc, body) => {
+        this.run(job, "Searching", async (qc, body, emb) => {
           const name = str(body.collection);
-          const vector = numberArray(jsonArray(body.vector, "vector"), "vector");
+          const vector = await resolveQueryVector(body, emb);
           const limit = int(body.limit ?? 10, "limit");
           const result = await qc.search(name, vector, limit, {
             filter: jsonObjectOrUndefined(body.filter, "filter"),
@@ -206,14 +218,20 @@ export class Registry {
   private async run(
     job: Job,
     title: string,
-    work: (qc: Qdrant, body: Record<string, unknown>) => Promise<Record<string, unknown>>,
+    work: (
+      qc: Qdrant,
+      body: Record<string, unknown>,
+      emb: EmbeddingSettings,
+    ) => Promise<Record<string, unknown>>,
   ): Promise<void> {
     let body: Record<string, unknown>;
     let settings: QdrantSettings;
+    let embedding: EmbeddingSettings;
     try {
       const req = castRequestTo<Record<string, unknown> & { settings?: Record<string, unknown> }>(job.req.data);
       body = { ...(req.body ?? {}) };
       settings = readSettings(body.settings);
+      embedding = readEmbedding(body.settings);
       delete body.settings; // the connection travels separately, not as action input
     } catch (e) {
       await job.doneWithError(errText(e));
@@ -223,7 +241,7 @@ export class Registry {
     try {
       const qc = new Qdrant(settings);
       await job.progress(20, { title, content: str(body.collection) || settings.url });
-      const out = await work(qc, body);
+      const out = await work(qc, body, embedding);
       await job.progress(90, { title, content: "done" });
       await job.done(out);
     } catch (e) {
@@ -237,7 +255,10 @@ export class Registry {
   // anything — the platform keeps the profile and ships it back as body.settings.
   private settingsSubmit(req: Request): Response {
     try {
-      const { body } = castRequestTo<Record<string, unknown>>(req.data);
+      // The submit posts the form's values; tolerate either the flat object (as
+      // meta calls use) or a { body } envelope.
+      const raw = metaInput(req);
+      const body = raw.body && typeof raw.body === "object" ? (raw.body as Record<string, unknown>) : raw;
       readSettings(body); // throws if the URL is missing/blank
       return { data: { ok: true } };
     } catch (e) {
@@ -251,23 +272,76 @@ export class Registry {
   private async metaPing(req: Request): Promise<Response> {
     let settings: QdrantSettings;
     try {
-      const { body } = castRequestTo<Record<string, unknown>>(req.data);
-      settings = readSettings(body);
+      settings = readSettings(metaInput(req));
     } catch (e) {
-      return { error: errText(e) };
+      return { data: formkit.failure("%s", errText(e)).about("url").patch(null) };
     }
     try {
       const qc = new Qdrant(settings);
       const res = (await qc.listCollections()) as { collections?: { name: string }[] };
       const count = res.collections?.length ?? 0;
-      return { data: { ok: true, message: `Connected — ${count} collection(s) reachable.` } };
+      return {
+        data: formkit
+          .success("Connected — %s collection(s) reachable.", String(count))
+          .about("url")
+          .patch(null),
+      };
     } catch (e) {
-      return { data: { ok: false }, error: errText(e) };
+      return {
+        data: formkit.failure("Cannot reach Qdrant: %s", errText(e)).about("url").patch(null),
+      };
+    }
+  }
+
+  // metaEmbed backs the "Test embedding" button: embed a short probe with the
+  // provider configured in the open settings form and report the vector size —
+  // the number the user needs for a collection's "Vector size".
+  private async metaEmbed(req: Request): Promise<Response> {
+    let embedding: EmbeddingSettings;
+    try {
+      embedding = readEmbedding(metaInput(req));
+    } catch (e) {
+      return { data: formkit.failure("%s", errText(e)).about("embeddingModel").patch(null) };
+    }
+    if (embedding.provider === undefined) {
+      return {
+        data: formkit
+          .warning("Pick an embedding provider first, then test.")
+          .about("embeddingModel")
+          .patch(null),
+      };
+    }
+    try {
+      const [vec] = await embedTexts(embedding, ["ping"], "query");
+      return {
+        data: formkit
+          .success(
+            "Embedded a probe — %s-dimensional vectors (use %s as the collection's Vector size).",
+            String(vec.length),
+            String(vec.length),
+          )
+          .about("embeddingModel")
+          .patch(null),
+      };
+    } catch (e) {
+      return {
+        data: formkit.failure("Embedding failed: %s", errText(e)).about("embeddingModel").patch(null),
+      };
     }
   }
 }
 
 // ---------------------------------------------------------------- helpers --
+
+// metaInput decodes a lookup-button (meta) request. Unlike an action execution,
+// which arrives as the { _registry, body } envelope castRequestTo expects, a meta
+// call posts the open form's current values as a flat object — the connection and
+// embedding fields at the top level (alongside `settings`, `value`, `targetField`).
+// readSettings/readEmbedding pick the keys they need and ignore the rest.
+function metaInput(req: Request): Record<string, unknown> {
+  const parsed = JSON.parse(decoder.decode(req.data)) as unknown;
+  return parsed && typeof parsed === "object" ? (parsed as Record<string, unknown>) : {};
+}
 
 // readSettings extracts and validates the Qdrant connection from a settings map
 // (either the raw settings form body, or body.settings folded into an action).
@@ -276,6 +350,97 @@ function readSettings(raw: unknown): QdrantSettings {
   const url = str(s.url);
   if (url === "") throw new Error("Qdrant URL is not set — fill it in the node's settings");
   return { url, apiKey: str(s.apiKey) || undefined };
+}
+
+// readEmbedding extracts the optional embedding-provider config from the same
+// settings map that carries the Qdrant connection. Absent or "none" means the
+// node embeds nothing; the actions then require a raw vector, and this is not an
+// error until text is actually supplied.
+function readEmbedding(raw: unknown): EmbeddingSettings {
+  const s = (raw as Record<string, unknown>) ?? {};
+  const provider = str(s.embeddingProvider) as EmbeddingProvider | "none" | "";
+  if (provider === "" || provider === "none") return { provider: undefined };
+  return {
+    provider: provider as EmbeddingProvider,
+    model: str(s.embeddingModel) || undefined,
+    apiKey: str(s.embeddingApiKey) || undefined,
+    baseUrl: str(s.embeddingBaseUrl) || undefined,
+  };
+}
+
+// resolvePoints turns the user's points array into what Qdrant's upsert wants.
+// A point may carry an explicit `vector`, or a `text` that is embedded here (and
+// kept under payload.text so search results carry the original content). An `id`
+// is generated when omitted. All texts across the batch are embedded in one call.
+async function resolvePoints(
+  raw: unknown[],
+  emb: EmbeddingSettings,
+): Promise<Record<string, unknown>[]> {
+  const points = raw.map((p, i) => {
+    if (typeof p !== "object" || p === null || Array.isArray(p)) {
+      throw new Error(`"points"[${i}] must be an object`);
+    }
+    return { ...(p as Record<string, unknown>) };
+  });
+
+  // Collect the points that need embedding, with their position, so one batch
+  // call fills them all in order.
+  const toEmbed: { at: number; text: string }[] = [];
+  for (let i = 0; i < points.length; i++) {
+    const p = points[i];
+    const hasVector = Array.isArray(p.vector);
+    const text = typeof p.text === "string" ? p.text : undefined;
+    if (!hasVector && text === undefined) {
+      throw new Error(`"points"[${i}] needs a "vector" or a "text" to embed`);
+    }
+    if (!hasVector && text !== undefined) {
+      if (text.trim() === "") throw new Error(`"points"[${i}].text is empty`);
+      toEmbed.push({ at: i, text });
+    }
+  }
+
+  if (toEmbed.length > 0) {
+    const vectors = await embedTexts(emb, toEmbed.map((t) => t.text), "document");
+    toEmbed.forEach(({ at, text }, k) => {
+      const p = points[at];
+      p.vector = vectors[k];
+      // Keep the source text discoverable in the result unless the caller set it.
+      const payload = (typeof p.payload === "object" && p.payload !== null && !Array.isArray(p.payload))
+        ? (p.payload as Record<string, unknown>)
+        : {};
+      if (!("text" in payload)) payload.text = text;
+      p.payload = payload;
+      delete p.text; // Qdrant's point schema has no "text" field
+    });
+  }
+
+  // Any remaining points embedded nothing; drop a stray "text" alongside a vector.
+  for (const p of points) {
+    if ("text" in p && Array.isArray(p.vector)) delete p.text;
+    if (p.id === undefined || p.id === null) p.id = randomUUID();
+  }
+  return points;
+}
+
+// resolveQueryVector produces the search vector from either query text (embedded
+// as a query) or a raw vector — exactly one of the two.
+async function resolveQueryVector(
+  body: Record<string, unknown>,
+  emb: EmbeddingSettings,
+): Promise<number[]> {
+  const text = str(body.text).trim();
+  const hasVector = body.vector != null && str(body.vector).trim() !== "";
+  if (text !== "" && hasVector) {
+    throw new Error('provide either "text" or a "vector" to search by, not both');
+  }
+  if (text !== "") {
+    const [vec] = await embedTexts(emb, [text], "query");
+    return vec;
+  }
+  if (hasVector) {
+    return numberArray(jsonArray(body.vector, "vector"), "vector");
+  }
+  throw new Error('provide a query "text" (with an embedding provider) or a raw "vector"');
 }
 
 function str(v: unknown): string {

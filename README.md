@@ -13,21 +13,38 @@ Runs on **any host** that speaks `inflowv1` — it reaches no host-specific serv
 |--------|-------|------|
 | `qdrant.collection.create` | Create collection | Create a collection with a vector size + distance metric. |
 | `qdrant.collection.list` | List collections | Names of every collection. |
-| `qdrant.points.upsert` | Upsert points | Insert/overwrite points (`id` + `vector` + `payload`). |
-| `qdrant.points.search` | Vector search | Nearest-neighbour search, optionally filtered. |
+| `qdrant.points.upsert` | Upsert points | Insert/overwrite points; each carries a `vector` or a `text` to embed. |
+| `qdrant.points.search` | Vector search | Nearest-neighbour search by query `text` (embedded) or a raw `vector`, optionally filtered. |
 | `qdrant.points.retrieve` | Retrieve points | Fetch points by ID. |
 | `qdrant.points.scroll` | Scroll points | Page through points by filter. |
 | `qdrant.points.delete` | Delete points | Delete by ID list or by filter. |
 
-Plus the `qdrant.meta.ping` meta function behind the settings dialog's **Test
-connection** button.
+Plus the `qdrant.meta.ping` (**Test connection**) and `qdrant.meta.embed` (**Test
+embedding**) meta functions behind the settings dialog.
+
+## Embeddings
+
+Qdrant searches vectors, not text. Configure an embedding provider in the node's
+**settings** (**Embeddings** section) and **Upsert** and **Vector search** accept
+plain text, embedding it for you before it reaches Qdrant:
+
+- **Providers**: OpenAI, Google Gemini, Cohere, or **Custom** — any
+  OpenAI-compatible endpoint (Ollama, LM Studio, vLLM). Leave it **None** to supply
+  vectors yourself.
+- On upsert, a point's `text` is embedded and kept under `payload.text`; a missing
+  `id` is auto-generated (UUID).
+- On search, the query `text` is embedded as a query. A raw `vector` still works on
+  either action to bypass embedding.
+- A collection's **Vector size** must match the embedding model's dimension — use
+  **Test embedding** to read it off.
 
 ## Credentials
 
 The node holds **no** credentials. A Qdrant instance is configured per-account in
-the node's **settings** (URL + optional API key); the platform stores it as a
-named profile and folds it into every call as `body.settings`. Structured inputs
-(vector, points, filter, IDs) are entered as **JSON**.
+the node's **settings** (URL + optional API key), alongside the optional embedding
+provider (its own key); the platform stores it as a named profile and folds it into
+every call as `body.settings`. Structured inputs (vector, points, filter, IDs) are
+entered as **JSON**.
 
 ## Develop
 
