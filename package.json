@@ -1,0 +1,25 @@
+{
+  "name": "@inflowenger/qdrant-plugin",
+  "version": "0.1.0",
+  "description": "Inflowenger plugin node for the Qdrant vector database — create collections, upsert points, vector search, retrieve, scroll and delete. Talks directly to Qdrant's REST API; holds no credentials. Built on @inflowenger/node-plugin-sdk.",
+  "type": "module",
+  "private": true,
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json && cp src/manual.md dist/manual.md",
+    "clean": "rm -rf dist",
+    "start": "node dist/main.js",
+    "dev": "tsx src/main.ts"
+  },
+  "dependencies": {
+    "@inflowenger/node-plugin-sdk": "^0.1.5",
+    "nats": "^2.29.3"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.1",
+    "tsx": "^4.19.2",
+    "typescript": "^5.6.0"
+  }
+}
