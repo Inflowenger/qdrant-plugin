@@ -90,10 +90,21 @@ raw `vector` on either action to bypass embedding.
 
 ### JsonPath tokens
 
-Any text field — **Text to embed**, a **Query text**, and each **key/value** — may
-contain a `{{$.path}}` token that is resolved from the flow's context before the
-action runs. For example, a payload tag value of `{{$.trigger.userId}}` stores the
-upstream trigger's user id. Tokens the context can't supply are left in place.
+**Every** text and JSON field on every action may contain `{{$.path}}` tokens,
+resolved from the flow's context before the action runs — a collection name, a
+**Text to embed** or **Query text**, both halves of a **key/value** row, and the
+tokens inside a JSON field (**Filter**, **IDs**, **Vector**, **Points**,
+**Offset**). Resolution reaches any depth, so a token works wherever it sits, e.g.:
+
+- Payload tag value `{{$.trigger.userId}}` → stores the upstream user id.
+- Scroll **Offset** `{{$.scrolled.result.next_page_offset}}` → resumes paging from
+  the previous run.
+- Filter `{"must":[{"key":"tenant","match":{"value":"{{$.tenant}}"}}]}` → narrows to
+  the current tenant.
+
+A token that resolves to a number or boolean is typed as one; tokens the context
+can't supply are left in place verbatim, so nothing is silently dropped. (The
+node's connection settings are not part of a run and are not resolved.)
 
 ## Test the connection
 

@@ -175,7 +175,7 @@ export class Registry {
           const limit = int(body.limit ?? 50, "limit");
           const result = await qc.scroll(name, limit, {
             filter: jsonObjectOrUndefined(body.filter, "filter"),
-            offset: jsonOrUndefined(body.offset),
+            offset: offsetValue(body.offset),
             withPayload: bool(body.withPayload, true),
             withVector: bool(body.withVector),
           });
@@ -639,6 +639,23 @@ function parseJson(v: unknown, field: string): unknown {
 
 function jsonOrUndefined(v: unknown): unknown {
   return parseJson(v, "value");
+}
+
+// offsetValue reads a scroll offset, which Qdrant accepts as a number or a point
+// id (an integer or a UUID string). A clean JSON value — a number, or a quoted
+// string — is taken as-is; anything else is used verbatim as a string id. That
+// last case matters most for a {{$.…next_page_offset}} token, which resolves to a
+// bare id (e.g. 007 or a UUID) that is not valid standalone JSON.
+function offsetValue(v: unknown): unknown {
+  if (v == null) return undefined;
+  if (typeof v !== "string") return v; // already structured (a number/id)
+  const t = v.trim();
+  if (t === "") return undefined;
+  try {
+    return JSON.parse(t);
+  } catch {
+    return t;
+  }
 }
 
 function jsonObjectOrUndefined(v: unknown, field: string): Record<string, unknown> | undefined {

@@ -62,11 +62,16 @@ export class VarResolver {
 }
 
 /**
- * Walk a decoded action input and rewrite {{$...}} tokens in place, sharing one
- * resolver so a path referenced by several fields is fetched once. Covers plain
- * `string` fields, `string[]` fields, and arrays of key/value row objects (the
- * shape the payload-tag and filter lists arrive in). Plain values with no token
- * never hit the runtime, so this is safe to run over every action's input.
+ * Walk a decoded action input and rewrite {{$...}} tokens in every string it
+ * holds, at any depth, sharing one resolver so a path referenced more than once
+ * is fetched once. This is the single place JsonPath resolution is turned on:
+ * because it descends into strings, arrays, and nested objects alike, every
+ * text-bearing form field an action carries is resolvable — a collection name, a
+ * query text, the halves of a key/value row, and the tokens inside a JSON
+ * textarea (filter, ids, vector, points, offset) whether that field arrives as
+ * raw text or already parsed. Non-string leaves (numbers, booleans, null) pass
+ * through untouched, and a value with no `{{` never hits the runtime, so this is
+ * safe to run over every action's input.
  */
 export async function resolveInputVars<T extends Record<string, unknown>>(
   job: Job,
@@ -78,9 +83,10 @@ export async function resolveInputVars<T extends Record<string, unknown>>(
   }
 }
 
-// resolveValue rewrites tokens in one value: a string directly, an array
-// element-wise, and a plain object property-wise (one level, enough for a
-// {key,value} row). Numbers, booleans and null pass through untouched.
+// resolveValue rewrites tokens in one value, recursing to any depth: a string
+// directly, an array element-wise, and an object property-wise (so nested
+// objects and the values of a {key,value} row are covered). Numbers, booleans
+// and null pass through untouched.
 async function resolveValue(value: unknown, resolver: VarResolver): Promise<unknown> {
   if (typeof value === "string") return resolver.resolve(value);
   if (Array.isArray(value)) {
@@ -90,9 +96,7 @@ async function resolveValue(value: unknown, resolver: VarResolver): Promise<unkn
   }
   if (value !== null && typeof value === "object") {
     const obj = value as Record<string, unknown>;
-    for (const k of Object.keys(obj)) {
-      if (typeof obj[k] === "string") obj[k] = await resolver.resolve(obj[k] as string);
-    }
+    for (const k of Object.keys(obj)) obj[k] = await resolveValue(obj[k], resolver);
     return obj;
   }
   return value;

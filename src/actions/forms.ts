@@ -86,14 +86,14 @@ export const settingsForm = form("Qdrant connection")
 const collectionField = (pickForm?: string) => {
   const f = text("collection", "Collection")
     .required()
-    .help("Name of the Qdrant collection to act on.");
+    .help("Name of the Qdrant collection to act on. Accepts {{$.path}} tokens.");
   if (pickForm) f.lookup("qdrant.meta.collections", "List").picks(pickForm);
   return f;
 };
 
 export const createCollectionForm = form("Create collection")
   .add(
-    text("collection", "Collection name").required(),
+    text("collection", "Collection name").required().help("Accepts {{$.path}} tokens."),
     integer("size", "Vector size").required().min(1).help("Dimensionality of the vectors this collection stores."),
     enumOf("distance", "Distance", "Cosine", "Dot", "Euclid", "Manhattan").required().default("Cosine"),
     bool("onDiskPayload", "Store payload on disk").default(false).help("Keep payloads on disk instead of RAM (larger, cheaper collections)."),
@@ -117,16 +117,16 @@ export const upsertForm = form("Upsert points")
           'Keys and values accept {{$.path}} tokens; a value like 42 or true is stored as a number/boolean — quote it ("42") to force a string.',
       ),
     text("id", "Point ID (optional)")
-      .help("Number or UUID string. A UUID is generated when left blank."),
+      .help("Number or UUID string. A UUID is generated when left blank. Accepts {{$.path}} tokens."),
     json("vector", "Vector (JSON array, optional)")
-      .help("Give an explicit vector instead of Text to embed, e.g. [0.1, 0.2, 0.3]."),
+      .help("Give an explicit vector instead of Text to embed, e.g. [0.1, 0.2, 0.3]. Accepts {{$.path}} tokens."),
   )
   .group(
     "Batch (advanced)",
     json("points", "Points (JSON array)")
       .help(
         'Overrides the single point above. With an embedding provider: [{"text":"a red bicycle","payload":{"sku":"B1"}}]. ' +
-          'Without one, or to bypass embedding: [{"id":1,"vector":[0.1,0.2],"payload":{"tag":"a"}}].',
+          'Without one, or to bypass embedding: [{"id":1,"vector":[0.1,0.2],"payload":{"tag":"a"}}]. Accepts {{$.path}} tokens.',
       ),
     bool("wait", "Wait for completion").default(true).help("Return only once the write is applied."),
   )
@@ -137,14 +137,14 @@ export const searchForm = form("Vector search")
   .add(
     collectionField("qdrant.points.search"),
     text("text", "Query text").help("Embedded with the configured provider and searched. Leave blank to search by a raw vector instead. Accepts {{$.path}} tokens."),
-    json("vector", "Query vector (JSON array)").help("Array of numbers, e.g. [0.1, 0.2, 0.3]. Used only when Query text is blank."),
+    json("vector", "Query vector (JSON array)").help("Array of numbers, e.g. [0.1, 0.2, 0.3]. Used only when Query text is blank. Accepts {{$.path}} tokens."),
     keyValueList("filters", "Payload filters (key/value)")
       .help(
         "Each row narrows results to points whose payload key equals the value (Qdrant must-match), e.g. tag → a. " +
           'Keys and values accept {{$.path}} tokens; 42 or true match a number/boolean — quote it ("42") to match a string.',
       ),
     integer("limit", "Limit").default(10).min(1),
-    json("filter", "Filter (JSON object, advanced)").help('Raw Qdrant filter merged with the rows above, e.g. {"must":[{"key":"tag","match":{"value":"a"}}]}'),
+    json("filter", "Filter (JSON object, advanced)").help('Raw Qdrant filter merged with the rows above, e.g. {"must":[{"key":"tag","match":{"value":"a"}}]}. Accepts {{$.path}} tokens.'),
     number("scoreThreshold", "Score threshold (optional)").help("Only return points scoring at or above this value."),
     bool("withPayload", "Include payload").default(true),
     bool("withVector", "Include vector").default(false),
@@ -154,7 +154,7 @@ export const searchForm = form("Vector search")
 export const retrieveForm = form("Retrieve points")
   .add(
     collectionField("qdrant.points.retrieve"),
-    json("ids", "Point IDs (JSON array)").required().help('e.g. [1, 2, 3] or ["a1b2..."]'),
+    json("ids", "Point IDs (JSON array)").required().help('e.g. [1, 2, 3] or ["a1b2..."]. Accepts {{$.path}} tokens.'),
     bool("withPayload", "Include payload").default(true),
     bool("withVector", "Include vector").default(false),
   )
@@ -165,8 +165,8 @@ export const scrollForm = form("Scroll points")
   .add(
     collectionField("qdrant.points.scroll"),
     integer("limit", "Limit").default(50).min(1),
-    json("filter", "Filter (JSON object, optional)").help('e.g. {"must":[{"key":"tag","match":{"value":"a"}}]}'),
-    json("offset", "Offset (optional)").help("The next_page_offset from a previous scroll, as JSON (a number, string, or id)."),
+    json("filter", "Filter (JSON object, optional)").help('e.g. {"must":[{"key":"tag","match":{"value":"a"}}]}. Accepts {{$.path}} tokens.'),
+    json("offset", "Offset (optional)").help("The next_page_offset from a previous scroll (a number, string, or id) — often a {{$.path}} token pointing at the last run's result."),
     bool("withPayload", "Include payload").default(true),
     bool("withVector", "Include vector").default(false),
   )
@@ -176,8 +176,8 @@ export const deleteForm = form("Delete points")
   .describe("Delete points by an explicit ID list, or by a payload filter. Provide exactly one.")
   .add(
     collectionField("qdrant.points.delete"),
-    json("ids", "Point IDs (JSON array, optional)").help('e.g. [1, 2, 3]'),
-    json("filter", "Filter (JSON object, optional)").help('e.g. {"must":[{"key":"tag","match":{"value":"old"}}]}'),
+    json("ids", "Point IDs (JSON array, optional)").help('e.g. [1, 2, 3]. Accepts {{$.path}} tokens.'),
+    json("filter", "Filter (JSON object, optional)").help('e.g. {"must":[{"key":"tag","match":{"value":"old"}}]}. Accepts {{$.path}} tokens.'),
     bool("wait", "Wait for completion").default(true),
   )
   .build();
