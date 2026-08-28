@@ -80,7 +80,7 @@ export class Registry {
       icon: { icon: "mdi-database-plus" },
       form: createCollectionForm,
       requestHandler: (job) =>
-        this.run(job, "Creating collection", async (qc, body) => {
+        this.run(job, async (qc, body) => {
           const name = str(body.collection);
           const size = int(body.size, "size");
           const distance = str(body.distance || "Cosine") as Distance;
@@ -98,7 +98,7 @@ export class Registry {
       icon: { icon: "mdi-database-search" },
       form: listCollectionsForm,
       requestHandler: (job) =>
-        this.run(job, "Listing collections", async (qc) => {
+        this.run(job, async (qc) => {
           const res = (await qc.listCollections()) as { collections?: { name: string }[] };
           return { collections: (res.collections ?? []).map((c) => c.name) };
         }),
@@ -113,7 +113,7 @@ export class Registry {
       icon: { icon: "mdi-database-import" },
       form: upsertForm,
       requestHandler: (job) =>
-        this.run(job, "Upserting points", async (qc, body, emb) => {
+        this.run(job, async (qc, body, emb) => {
           const name = str(body.collection);
           const points = await buildUpsertPoints(body, emb);
           const result = await qc.upsert(name, points, bool(body.wait, true));
@@ -130,7 +130,7 @@ export class Registry {
       icon: { icon: "mdi-vector-triangle" },
       form: searchForm,
       requestHandler: (job) =>
-        this.run(job, "Searching", async (qc, body, emb) => {
+        this.run(job, async (qc, body, emb) => {
           const name = str(body.collection);
           const vector = await resolveQueryVector(body, emb);
           const limit = int(body.limit ?? 10, "limit");
@@ -153,7 +153,7 @@ export class Registry {
       icon: { icon: "mdi-database-export" },
       form: retrieveForm,
       requestHandler: (job) =>
-        this.run(job, "Retrieving points", async (qc, body) => {
+        this.run(job, async (qc, body) => {
           const name = str(body.collection);
           const ids = idArray(jsonArray(body.ids, "ids"), "ids");
           const result = await qc.retrieve(name, ids, bool(body.withPayload, true), bool(body.withVector));
@@ -170,12 +170,15 @@ export class Registry {
       icon: { icon: "mdi-format-list-bulleted" },
       form: scrollForm,
       requestHandler: (job) =>
-        this.run(job, "Scrolling points", async (qc, body) => {
+        this.run(job, async (qc, body) => {
           const name = str(body.collection);
           const limit = int(body.limit ?? 50, "limit");
+          // A missing/invalid offset must be null (Qdrant: "start from the first
+          // page"), never 0 — 0 is an integer point id, so on a UUID-keyed
+          // collection it silently restarts pagination instead of continuing.
           const result = await qc.scroll(name, limit, {
             filter: jsonObjectOrUndefined(body.filter, "filter"),
-            offset: offsetValue(body.offset) || 0,
+            offset: offsetValue(body.offset),
             withPayload: bool(body.withPayload, true),
             withVector: bool(body.withVector),
           });
@@ -192,7 +195,7 @@ export class Registry {
       icon: { icon: "mdi-database-remove" },
       form: deleteForm,
       requestHandler: (job) =>
-        this.run(job, "Deleting points", async (qc, body) => {
+        this.run(job, async (qc, body) => {
           const name = str(body.collection);
           const idsRaw = jsonOrUndefined(body.ids);
           const filter = jsonObjectOrUndefined(body.filter, "filter");
@@ -218,7 +221,6 @@ export class Registry {
   // error (bad JSON, unreachable Qdrant, an API error) ends the job cleanly.
   private async run(
     job: Job,
-    title: string,
     work: (
       qc: Qdrant,
       body: Record<string, unknown>,
@@ -244,10 +246,14 @@ export class Registry {
       // …) against the flow scope before the action reads any of them.
       await resolveInputVars(job, body);
 
+      // A one-shot action: one Qdrant REST call, one terminal signal. We do NOT
+      // emit intermediate progress frames — each would be a separate NATS
+      // round-trip on the job subject, and a rising 20→90→100 for a single call
+      // buys nothing but extra hops that can land on an already-torn-down job
+      // (surfacing as the SDK's "No responders" retry loop). The work either
+      // finishes and we commit its result with done(100), or it throws.
       const qc = new Qdrant(settings);
-      await job.progress(20, { title, content: str(body.collection) || settings.url });
       const out = await work(qc, body, embedding);
-      await job.progress(90, { title, content: "done" });
       await job.done(out);
     } catch (e) {
       await job.doneWithError(errText(e));
@@ -641,17 +647,35 @@ function jsonOrUndefined(v: unknown): unknown {
   return parseJson(v, "value");
 }
 
-// offsetValue reads a scroll offset, which Qdrant accepts as a number or a point
-// id (an integer or a UUID string). A clean JSON value — a number, or a quoted
-// string — is taken as-is; anything else is used verbatim as a string id. That
-// last case matters most for a {{$.…next_page_offset}} token, which resolves to a
-// bare id (e.g. 007 or a UUID) that is not valid standalone JSON.
+// offsetValue reads a scroll offset, which Qdrant accepts only as a point id: an
+// unsigned integer or a UUID string. Anything that is not a valid id — an empty
+// value, or the `{}` a {{$.…next_page_offset}} token resolves to when the previous
+// page had a null offset — becomes null, which tells Qdrant to start from the
+// first page rather than sending a bad value that 400s. A real id must be passed
+// through UNCHANGED: coercing a UUID (or any string) to 0 silently restarts
+// pagination from the beginning instead of continuing.
+const UUID_RE = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
+
 function offsetValue(v: unknown): unknown {
   if (v == null) return null;
-  if (typeof v !== "string") return v; // already structured (a number/id)
-  const t = v.trim();
+  // A number is a valid id as long as it is a non-negative integer.
+  if (typeof v === "number") return Number.isInteger(v) && v >= 0 ? v : null;
+  // Anything non-string that reaches here (e.g. the `{}` from a null next offset)
+  // is not a usable id — fall back to the first page.
+  if (typeof v !== "string") return null;
+  let t = v.trim();
   if (t === "") return null;
-  return 0;
+  // A quoted JSON string ("uuid…") or a JSON number unwraps to its scalar first.
+  try {
+    const parsed = JSON.parse(t);
+    if (typeof parsed === "number") return Number.isInteger(parsed) && parsed >= 0 ? parsed : null;
+    if (typeof parsed === "string") t = parsed.trim();
+  } catch {
+    // not JSON — use the raw string below
+  }
+  if (/^\d+$/.test(t)) return Number(t); // an integer id typed as a string
+  if (UUID_RE.test(t)) return t; // a bare UUID id
+  return null; // not a valid point id → start from the first page
 }
 
 function jsonObjectOrUndefined(v: unknown, field: string): Record<string, unknown> | undefined {
