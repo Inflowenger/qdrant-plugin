@@ -175,7 +175,7 @@ export class Registry {
           const limit = int(body.limit ?? 50, "limit");
           const result = await qc.scroll(name, limit, {
             filter: jsonObjectOrUndefined(body.filter, "filter"),
-            offset: offsetValue(body.offset),
+            offset: offsetValue(body.offset) || 0,
             withPayload: bool(body.withPayload, true),
             withVector: bool(body.withVector),
           });
@@ -647,15 +647,11 @@ function jsonOrUndefined(v: unknown): unknown {
 // last case matters most for a {{$.…next_page_offset}} token, which resolves to a
 // bare id (e.g. 007 or a UUID) that is not valid standalone JSON.
 function offsetValue(v: unknown): unknown {
-  if (v == null) return undefined;
+  if (v == null) return null;
   if (typeof v !== "string") return v; // already structured (a number/id)
   const t = v.trim();
-  if (t === "") return undefined;
-  try {
-    return JSON.parse(t);
-  } catch {
-    return t;
-  }
+  if (t === "") return null;
+  return 0;
 }
 
 function jsonObjectOrUndefined(v: unknown, field: string): Record<string, unknown> | undefined {
